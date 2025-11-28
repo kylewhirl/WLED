@@ -187,7 +187,7 @@ BusDigital::BusDigital(const BusConfig &bc, uint8_t nr)
   _hasCCT = hasCCT(bc.type);
   uint16_t lenToCreate = bc.count;
   if (bc.type == TYPE_WS2812_1CH_X3) lenToCreate = NUM_ICS_WS2812_1CH_3X(bc.count); // only needs a third of "RGB" LEDs for NeoPixelBus
-  if (bc.type == TYPE_WS2811_2IC_5CH) lenToCreate = bc.count * 2; // needs 2 "RGB" LEDs per pixel
+  if (bc.type == TYPE_WS2811_2IC_5CH || bc.type == TYPE_WS2811_RGBCCT_DUAL) lenToCreate = bc.count * 2; // needs 2 "RGB" LEDs per pixel
   _busPtr = PolyBus::create(_iType, _pins, lenToCreate + _skip, nr);
   _valid = (_busPtr != nullptr) && bc.count > 0;
   // fix for wled#4759
@@ -256,17 +256,17 @@ void BusDigital::applyBriLimit(uint8_t newBri) {
     uint8_t cctWW = 0, cctCW = 0;
     unsigned hwLen = _len;
     if (_type == TYPE_WS2812_1CH_X3) hwLen = NUM_ICS_WS2812_1CH_3X(_len); // only needs a third of "RGB" LEDs for NeoPixelBus
-    if (_type == TYPE_WS2811_2IC_5CH) hwLen = _len * 2; // needs 2 "RGB" LEDs per pixel
+    if (_type == TYPE_WS2811_2IC_5CH || _type == TYPE_WS2811_RGBCCT_DUAL) hwLen = _len * 2; // needs 2 "RGB" LEDs per pixel
     for (unsigned i = 0; i < hwLen; i++) {
       // For 5CH, map buffer index to logical pixel index to get correct color order
-      unsigned logicalPix = (_type == TYPE_WS2811_2IC_5CH) ? i / 2 : i + _start;
+      unsigned logicalPix = (_type == TYPE_WS2811_2IC_5CH || _type == TYPE_WS2811_RGBCCT_DUAL) ? i / 2 : i + _start;
       uint8_t co = _colorOrderMap.getPixelColorOrder(logicalPix + _start, _colorOrder);
       
       uint32_t c = PolyBus::getPixelColor(_busPtr, _iType, i, co);
       c = color_fade(c, newBri, true); // apply additional dimming
       
       // For 5CH, IC2 contains CW/WW in R/G channels, so we skip CCT recalculation
-      if (hasCCT() && _type != TYPE_WS2811_2IC_5CH) Bus::calculateCCT(c, cctWW, cctCW);
+      if (hasCCT() && _type != TYPE_WS2811_2IC_5CH && _type != TYPE_WS2811_RGBCCT_DUAL) Bus::calculateCCT(c, cctWW, cctCW);
       PolyBus::setPixelColor(_busPtr, _iType, i, c, co, (cctCW<<8) | cctWW); // repaint all pixels with new brightness
     }
   }
@@ -341,6 +341,21 @@ void IRAM_ATTR BusDigital::setPixelColor(unsigned pix, uint32_t c) {
     PolyBus::setPixelColor(_busPtr, _iType, pix + 1, c2, COL_ORDER_RGB);
     return;
   }
+  if (_type == TYPE_WS2811_RGBCCT_DUAL) { // map logical RGBCCT pixel onto 2 WS2811 ICs
+    unsigned pOld = pix;
+    pix = pOld * 2;
+    uint8_t cctWW = 0, cctCW = 0;
+    if (hasCCT()) Bus::calculateCCT(c, cctWW, cctCW);
+    if ((co >> 4) == 4) std::swap(cctWW, cctCW);
+
+    // IC1: R, G, B
+    PolyBus::setPixelColor(_busPtr, _iType, pix, c, co & 0x0F);
+
+    // IC2: CW, WW, unused
+    uint32_t c2 = RGBW32(cctCW, cctWW, 0, 0);
+    PolyBus::setPixelColor(_busPtr, _iType, pix + 1, c2, COL_ORDER_RGB);
+    return;
+  }
   uint16_t wwcw = 0;
   if (hasCCT()) {
     uint8_t cctWW = 0, cctCW = 0;
@@ -379,8 +394,22 @@ uint32_t IRAM_ATTR BusDigital::getPixelColor(unsigned pix) const {
     uint8_t b = B(c1);
     uint8_t cw = R(c2);
     uint8_t ww = G(c2);
-    
+
     // Return RGB + max(CW, WW) as W
+    c = RGBW32(r, g, b, std::max(cw, ww));
+  }
+  if (_type == TYPE_WS2811_RGBCCT_DUAL) { // map to correct ICs, each controls part of logical RGBCCT pixel
+    unsigned pOld = pix;
+    pix = pOld * 2;
+    uint32_t c1 = PolyBus::getPixelColor(_busPtr, _iType, pix, co);
+    uint32_t c2 = PolyBus::getPixelColor(_busPtr, _iType, pix + 1, co);
+
+    uint8_t r = R(c1);
+    uint8_t g = G(c1);
+    uint8_t b = B(c1);
+    uint8_t cw = R(c2);
+    uint8_t ww = G(c2);
+
     c = RGBW32(r, g, b, std::max(cw, ww));
   }
   if (_type == TYPE_WS2812_WWA) {
@@ -423,6 +452,7 @@ std::vector<LEDType> BusDigital::getLEDTypes() {
     {TYPE_SM16825,       "D",  PSTR("SM16825 RGBCW")},
     {TYPE_WS2812_1CH_X3, "D",  PSTR("WS2811 White")},
     //{TYPE_WS2812_2CH_X3, "D",  PSTR("WS281x CCT")}, // not implemented
+    {TYPE_WS2811_RGBCCT_DUAL, "D",  PSTR("WS2811 RGBCCT (dual IC)")},
     {TYPE_WS2811_2IC_5CH,"D",  PSTR("WS2811 2IC 5CH")},
     {TYPE_WS2812_WWA,    "D",  PSTR("WS281x WWA")}, // amber ignored
     {TYPE_WS2801,        "2P", PSTR("WS2801")},
@@ -1169,13 +1199,42 @@ size_t BusConfig::memUsage(unsigned nr) const {
   } else if (Bus::isDigital(type)) {
     // if any of digital buses uses I2S, there is additional common I2S DMA buffer not accounted for here
     unsigned len = count + skipAmount;
-    if (type == TYPE_WS2811_2IC_5CH) len *= 2;
+    if (type == TYPE_WS2811_2IC_5CH || type == TYPE_WS2811_RGBCCT_DUAL) len *= 2;
     return sizeof(BusDigital) + PolyBus::memUsage(len, PolyBus::getI(type, pins, nr));
   } else if (Bus::isOnOff(type)) {
     return sizeof(BusOnOff);
   } else {
     return sizeof(BusPwm);
   }
+}
+
+uint8_t BusConfig::typeFromString(const String& typeStr) {
+  if (typeStr.equalsIgnoreCase(F("WS2811_RGBCCT_DUAL"))) return TYPE_WS2811_RGBCCT_DUAL;
+  if (typeStr.equalsIgnoreCase(F("WS2811_2IC_5CH")))    return TYPE_WS2811_2IC_5CH;
+  if (typeStr.equalsIgnoreCase(F("WS2805")))            return TYPE_WS2805;
+  if (typeStr.equalsIgnoreCase(F("WS2812_RGB")))        return TYPE_WS2812_RGB;
+  if (typeStr.equalsIgnoreCase(F("SK6812_RGBW")))       return TYPE_SK6812_RGBW;
+  if (typeStr.equalsIgnoreCase(F("WS2811_400KHZ")))     return TYPE_WS2811_400KHZ;
+  return 0;
+}
+
+const char* BusConfig::typeToString(uint8_t type) {
+  switch (type) {
+    case TYPE_WS2811_RGBCCT_DUAL: return "WS2811_RGBCCT_DUAL";
+    case TYPE_WS2811_2IC_5CH:     return "WS2811_2IC_5CH";
+    case TYPE_WS2805:             return "WS2805";
+    case TYPE_WS2812_RGB:         return "WS2812_RGB";
+    case TYPE_SK6812_RGBW:        return "SK6812_RGBW";
+    case TYPE_WS2811_400KHZ:      return "WS2811_400KHZ";
+    default:                      return "";
+  }
+}
+
+uint8_t BusConfig::jsonGetType(const JsonVariantConst& val) {
+  if (val.is<const char*>()) {
+    return typeFromString(String(val.as<const char*>()));
+  }
+  return val | 0;
 }
 
 

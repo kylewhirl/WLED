@@ -221,7 +221,10 @@ bool deserializeConfig(JsonObject doc, bool fromFS) {
       uint8_t skipFirst = elm[F("skip")];
       uint16_t start = elm["start"] | 0;
       if (length==0 || start + length > MAX_LEDS) continue; // zero length or we reached max. number of LEDs, just stop
-      uint8_t ledType = elm["type"] | TYPE_WS2812_RGB;
+      JsonVariantConst typeVar = elm["type"];
+      uint8_t ledType = BusConfig::jsonGetType(typeVar);
+      if (!ledType) ledType = BusConfig::typeFromString(String((const char*)(elm[F("typestr")] | "")));
+      if (!ledType) ledType = TYPE_WS2812_RGB;
       bool reversed = elm["rev"];
       bool refresh = elm["ref"] | false;
       uint16_t freqkHz = elm[F("freq")] | 0;  // will be in kHz for DotStar and Hz for PWM
@@ -990,6 +993,7 @@ void serializeConfig(JsonObject root) {
     ins["rev"]       = bus->isReversed();
     ins[F("skip")]   = bus->skippedLeds();
     ins["type"]      = bus->getType() & 0x7F;
+    ins[F("typestr")] = BusConfig::typeToString(bus->getType() & 0x7F);
     ins["ref"]       = bus->isOffRefreshRequired();
     ins[F("rgbwm")]  = bus->getAutoWhiteMode();
     ins[F("freq")]   = bus->getFrequency();

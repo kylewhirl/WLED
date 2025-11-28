@@ -15,7 +15,6 @@
 
 #include "const.h"
 #include "pin_manager.h"
-#include <ArduinoJson.h>
 #include <vector>
 #include <memory>
 
@@ -462,9 +461,6 @@ struct BusConfig {
   }
 
   size_t memUsage(unsigned nr = 0) const;
-  static uint8_t typeFromString(const String& typeStr);
-  static const char* typeToString(uint8_t type);
-  static uint8_t jsonGetType(const JsonVariantConst& val);
 };
 
 

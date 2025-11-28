@@ -1208,35 +1208,6 @@ size_t BusConfig::memUsage(unsigned nr) const {
   }
 }
 
-uint8_t BusConfig::typeFromString(const String& typeStr) {
-  if (typeStr.equalsIgnoreCase(F("WS2811_RGBCCT_DUAL"))) return TYPE_WS2811_RGBCCT_DUAL;
-  if (typeStr.equalsIgnoreCase(F("WS2811_2IC_5CH")))    return TYPE_WS2811_2IC_5CH;
-  if (typeStr.equalsIgnoreCase(F("WS2805")))            return TYPE_WS2805;
-  if (typeStr.equalsIgnoreCase(F("WS2812_RGB")))        return TYPE_WS2812_RGB;
-  if (typeStr.equalsIgnoreCase(F("SK6812_RGBW")))       return TYPE_SK6812_RGBW;
-  if (typeStr.equalsIgnoreCase(F("WS2811_400KHZ")))     return TYPE_WS2811_400KHZ;
-  return 0;
-}
-
-const char* BusConfig::typeToString(uint8_t type) {
-  switch (type) {
-    case TYPE_WS2811_RGBCCT_DUAL: return "WS2811_RGBCCT_DUAL";
-    case TYPE_WS2811_2IC_5CH:     return "WS2811_2IC_5CH";
-    case TYPE_WS2805:             return "WS2805";
-    case TYPE_WS2812_RGB:         return "WS2812_RGB";
-    case TYPE_SK6812_RGBW:        return "SK6812_RGBW";
-    case TYPE_WS2811_400KHZ:      return "WS2811_400KHZ";
-    default:                      return "";
-  }
-}
-
-uint8_t BusConfig::jsonGetType(const JsonVariantConst& val) {
-  if (val.is<const char*>()) {
-    return typeFromString(String(val.as<const char*>()));
-  }
-  return val | 0;
-}
-
 
 size_t BusManager::memUsage() {
   // when ESP32, S2 & S3 use parallel I2S only the largest bus determines the total memory requirements for back buffers

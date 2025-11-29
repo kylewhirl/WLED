@@ -103,6 +103,11 @@ extern "C" {
 
 static ColorOrderMap _colorOrderMap = {};
 
+// Helper for WS2811 dual-IC RGBCCT variants
+static inline bool isWs2811Dual5Ch(uint8_t type) {
+  return type == TYPE_WS2811_2IC_5CH || type == TYPE_WS2811_FCOB_5CH;
+}
+
 bool ColorOrderMap::add(uint16_t start, uint16_t len, uint8_t colorOrder) {
   if (count() >= WLED_MAX_COLOR_ORDER_MAPPINGS || len == 0 || (colorOrder & 0x0F) > COL_ORDER_MAX) return false; // upper nibble contains W swap information
   _mappings.push_back({start,len,colorOrder});
@@ -187,7 +192,7 @@ BusDigital::BusDigital(const BusConfig &bc, uint8_t nr)
   _hasCCT = hasCCT(bc.type);
   uint16_t lenToCreate = bc.count;
   if (bc.type == TYPE_WS2812_1CH_X3) lenToCreate = NUM_ICS_WS2812_1CH_3X(bc.count); // only needs a third of "RGB" LEDs for NeoPixelBus
-  if (bc.type == TYPE_WS2811_2IC_5CH) lenToCreate = bc.count * 2; // needs 2 "RGB" LEDs per pixel
+  if (isWs2811Dual5Ch(bc.type)) lenToCreate = bc.count * 2; // needs 2 "RGB" LEDs per pixel
   _busPtr = PolyBus::create(_iType, _pins, lenToCreate + _skip, nr);
   _valid = (_busPtr != nullptr) && bc.count > 0;
   // fix for wled#4759
@@ -256,17 +261,17 @@ void BusDigital::applyBriLimit(uint8_t newBri) {
     uint8_t cctWW = 0, cctCW = 0;
     unsigned hwLen = _len;
     if (_type == TYPE_WS2812_1CH_X3) hwLen = NUM_ICS_WS2812_1CH_3X(_len); // only needs a third of "RGB" LEDs for NeoPixelBus
-    if (_type == TYPE_WS2811_2IC_5CH) hwLen = _len * 2; // needs 2 "RGB" LEDs per pixel
+    if (isWs2811Dual5Ch(_type)) hwLen = _len * 2; // needs 2 "RGB" LEDs per pixel
     for (unsigned i = 0; i < hwLen; i++) {
       // For 5CH, map buffer index to logical pixel index to get correct color order
-      unsigned logicalPix = (_type == TYPE_WS2811_2IC_5CH) ? i / 2 : i + _start;
+      unsigned logicalPix = isWs2811Dual5Ch(_type) ? i / 2 : i + _start;
       uint8_t co = _colorOrderMap.getPixelColorOrder(logicalPix + _start, _colorOrder);
       
       uint32_t c = PolyBus::getPixelColor(_busPtr, _iType, i, co);
       c = color_fade(c, newBri, true); // apply additional dimming
       
       // For 5CH, IC2 contains CW/WW in R/G channels, so we skip CCT recalculation
-      if (hasCCT() && _type != TYPE_WS2811_2IC_5CH) Bus::calculateCCT(c, cctWW, cctCW);
+      if (hasCCT() && !isWs2811Dual5Ch(_type)) Bus::calculateCCT(c, cctWW, cctCW);
       PolyBus::setPixelColor(_busPtr, _iType, i, c, co, (cctCW<<8) | cctWW); // repaint all pixels with new brightness
     }
   }
@@ -323,22 +328,28 @@ void IRAM_ATTR BusDigital::setPixelColor(unsigned pix, uint32_t c) {
       case 2: c = RGBW32(R(cOld), G(cOld), W(c)   , 0); break;
     }
   }
-  if (_type == TYPE_WS2811_2IC_5CH) { // map to correct ICs, each controls 1/2 LED
+  if (isWs2811Dual5Ch(_type)) { // map to correct ICs, each controls 1/2 LED
     unsigned pOld = pix;
     pix = pOld * 2;
     uint8_t cctWW = 0, cctCW = 0;
     if (hasCCT()) Bus::calculateCCT(c, cctWW, cctCW);
     // Check for CW/WW swap (upper nibble of color order)
     if ((co >> 4) == 4) std::swap(cctWW, cctCW);
-    
-    // IC1: R, G, B - Force no swap (ignore W swaps), keep only color order
-    PolyBus::setPixelColor(_busPtr, _iType, pix, c, co & 0x0F);
-    
-    // IC2: CW, WW, Unused - Pack CW/WW into R/G channels
-    // Force RGB order for IC2 to ensure CW is on R and WW is on G (physical pins 1 and 2)
-    // This makes output independent of user's color order setting for IC2
-    uint32_t c2 = RGBW32(cctCW, cctWW, 0, 0);
-    PolyBus::setPixelColor(_busPtr, _iType, pix + 1, c2, COL_ORDER_RGB);
+
+    const bool whitesFirst = (_type == TYPE_WS2811_FCOB_5CH); // FCOB routes whites through the first IC
+
+    // IC handling order is hardware dependent: standard dual-IC has RGB first, FCOB has whites first
+    const uint32_t cWhite = whitesFirst ? RGBW32(cctWW, cctCW, 0, 0) : RGBW32(cctCW, cctWW, 0, 0);
+    const uint32_t cRGB   = c;
+
+    // Always force deterministic mapping on the dedicated CCT IC to ignore user color swaps
+    if (whitesFirst) {
+      PolyBus::setPixelColor(_busPtr, _iType, pix, cWhite, COL_ORDER_RGB);      // IC1: CW, WW, unused
+      PolyBus::setPixelColor(_busPtr, _iType, pix + 1, cRGB,  co & 0x0F);        // IC2: RGB (obey user color order)
+    } else {
+      PolyBus::setPixelColor(_busPtr, _iType, pix,     cRGB,   co & 0x0F);       // IC1: RGB (obey user color order)
+      PolyBus::setPixelColor(_busPtr, _iType, pix + 1, cWhite, COL_ORDER_RGB);  // IC2: CW, WW, unused
+    }
     return;
   }
   uint16_t wwcw = 0;
@@ -368,18 +379,24 @@ uint32_t IRAM_ATTR BusDigital::getPixelColor(unsigned pix) const {
       case 2: c = RGBW32(b, b, b, b); break;
     }
   }
-  if (_type == TYPE_WS2811_2IC_5CH) { // map to correct ICs, each controls 1/2 LED
+  if (isWs2811Dual5Ch(_type)) { // map to correct ICs, each controls 1/2 LED
     unsigned pOld = pix;
     pix = pOld * 2;
+    const bool whitesFirst = (_type == TYPE_WS2811_FCOB_5CH);
+
     uint32_t c1 = PolyBus::getPixelColor(_busPtr, _iType, pix, co);
     uint32_t c2 = PolyBus::getPixelColor(_busPtr, _iType, pix + 1, co);
-    // c1 has R, G, B; c2 has CW (R), WW (G)
-    uint8_t r = R(c1);
-    uint8_t g = G(c1);
-    uint8_t b = B(c1);
-    uint8_t cw = R(c2);
-    uint8_t ww = G(c2);
-    
+
+    // Derive RGB and whites depending on which IC the hardware uses first
+    const uint32_t rgbIC = whitesFirst ? c2 : c1;
+    const uint32_t cctIC = whitesFirst ? c1 : c2;
+
+    uint8_t r  = R(rgbIC);
+    uint8_t g  = G(rgbIC);
+    uint8_t b  = B(rgbIC);
+    uint8_t cw = R(cctIC); // packed into R channel
+    uint8_t ww = G(cctIC); // packed into G channel
+
     // Return RGB + max(CW, WW) as W
     c = RGBW32(r, g, b, std::max(cw, ww));
   }
@@ -424,6 +441,7 @@ std::vector<LEDType> BusDigital::getLEDTypes() {
     {TYPE_WS2812_1CH_X3, "D",  PSTR("WS2811 White")},
     //{TYPE_WS2812_2CH_X3, "D",  PSTR("WS281x CCT")}, // not implemented
     {TYPE_WS2811_2IC_5CH,"D",  PSTR("WS2811 2IC 5CH")},
+    {TYPE_WS2811_FCOB_5CH,"D", PSTR("WS2811 FCOB RGBCCT")},
     {TYPE_WS2812_WWA,    "D",  PSTR("WS281x WWA")}, // amber ignored
     {TYPE_WS2801,        "2P", PSTR("WS2801")},
     {TYPE_APA102,        "2P", PSTR("APA102")},
@@ -1169,7 +1187,7 @@ size_t BusConfig::memUsage(unsigned nr) const {
   } else if (Bus::isDigital(type)) {
     // if any of digital buses uses I2S, there is additional common I2S DMA buffer not accounted for here
     unsigned len = count + skipAmount;
-    if (type == TYPE_WS2811_2IC_5CH) len *= 2;
+    if (isWs2811Dual5Ch(type)) len *= 2;
     return sizeof(BusDigital) + PolyBus::memUsage(len, PolyBus::getI(type, pins, nr));
   } else if (Bus::isOnOff(type)) {
     return sizeof(BusOnOff);

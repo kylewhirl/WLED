@@ -296,7 +296,8 @@ void BusDigital::setStatusPixel(uint32_t c) {
 
 void IRAM_ATTR BusDigital::setPixelColor(unsigned pix, uint32_t c) {
   if (!_valid) return;
-  if (hasWhite()) c = autoWhiteCalc(c);
+  // keep the provided warm/cool data for 2IC RGBCCT strips instead of auto-white mixing
+  if (hasWhite() && _type != TYPE_WS2811_2IC_5CH) c = autoWhiteCalc(c);
   if (Bus::_cct >= 1900) c = colorBalanceFromKelvin(Bus::_cct, c); //color correction from CCT
   c = color_fade(c, _bri, true); // apply brightness
 
@@ -305,6 +306,10 @@ void IRAM_ATTR BusDigital::setPixelColor(unsigned pix, uint32_t c) {
     uint8_t r = R(c), g = G(c), b = B(c);
     if (_milliAmpsPerLed < 255) { // normal ABL
       _colorSum += r + g + b + W(c);
+      if (_type == TYPE_WS2811_2IC_5CH && Bus::_cct >= 0 && Bus::_cct <= 255) {
+        // include cool-white contribution driven from the segment CCT slider
+        _colorSum += (Bus::_cct * _bri) / 255;
+      }
     } else { // wacky WS2815 power model, ignore white channel, use max of RGB (issue #549)
       _colorSum += ((r > g) ? ((r > b) ? r : b) : ((g > b) ? g : b));
     }
@@ -326,19 +331,21 @@ void IRAM_ATTR BusDigital::setPixelColor(unsigned pix, uint32_t c) {
   if (_type == TYPE_WS2811_2IC_5CH) { // map to correct ICs, each controls 1/2 LED
     unsigned pOld = pix;
     pix = pOld * 2;
-    uint8_t cctWW = 0, cctCW = 0;
-    if (hasCCT()) Bus::calculateCCT(c, cctWW, cctCW);
-    // Check for CW/WW swap (upper nibble of color order)
-    if ((co >> 4) == 4) std::swap(cctWW, cctCW);
-    
-    // IC1: R, G, B - Force no swap (ignore W swaps), keep only color order
-    PolyBus::setPixelColor(_busPtr, _iType, pix, c, co & 0x0F);
-    
-    // IC2: CW, WW, Unused - Pack CW/WW into R/G channels
-    // Force RGB order for IC2 to ensure CW is on R and WW is on G (physical pins 1 and 2)
-    // This makes output independent of user's color order setting for IC2
-    uint32_t c2 = RGBW32(cctCW, cctWW, 0, 0);
-    PolyBus::setPixelColor(_busPtr, _iType, pix + 1, c2, COL_ORDER_RGB);
+    // Use W channel as warm white and global CCT slider as cool white to present RGBWC order logically
+    uint8_t warm = W(c); // already brightness scaled by color_fade()
+    uint8_t cool = 0;
+    if (Bus::_cct >= 0 && Bus::_cct <= 255) cool = Bus::_cct; // treat segment CCT slider as the cool-white channel
+    // Apply brightness to the cool-white channel as well
+    cool = (cool * _bri) / 255;
+
+    // Allow swapping of warm/cool assignment via the upper nibble of the color order map
+    if ((co >> 4) == 4) std::swap(warm, cool);
+
+    // IC1: R, G, B - no white component
+    PolyBus::setPixelColor(_busPtr, _iType, pix, RGBW32(R(c), G(c), B(c), 0), co & 0x0F);
+
+    // IC2: Cool, Warm, Unused - packed into R/G
+    PolyBus::setPixelColor(_busPtr, _iType, pix + 1, RGBW32(cool, warm, 0, 0), COL_ORDER_RGB);
     return;
   }
   uint16_t wwcw = 0;

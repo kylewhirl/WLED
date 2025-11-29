@@ -164,6 +164,7 @@ BusDigital::BusDigital(const BusConfig &bc, uint8_t nr)
 , _colorOrder(bc.colorOrder)
 , _milliAmpsPerLed(bc.milliAmpsPerLed)
 , _milliAmpsMax(bc.milliAmpsMax)
+, _lenDriver(bc.count)
 {
   DEBUGBUS_PRINTLN(F("Bus: Creating digital bus."));
   if (!isDigital(bc.type) || !bc.count) { DEBUGBUS_PRINTLN(F("Not digial or empty bus!")); return; }
@@ -185,10 +186,9 @@ BusDigital::BusDigital(const BusConfig &bc, uint8_t nr)
   _hasRgb = hasRGB(bc.type);
   _hasWhite = hasWhite(bc.type);
   _hasCCT = hasCCT(bc.type);
-  uint16_t lenToCreate = bc.count;
-  if (bc.type == TYPE_WS2812_1CH_X3) lenToCreate = NUM_ICS_WS2812_1CH_3X(bc.count); // only needs a third of "RGB" LEDs for NeoPixelBus
-  if (bc.type == TYPE_WS2811_2IC_5CH) lenToCreate = bc.count * 2; // needs 2 "RGB" LEDs per pixel
-  _busPtr = PolyBus::create(_iType, _pins, lenToCreate + _skip, nr);
+  if (bc.type == TYPE_WS2812_1CH_X3) _lenDriver = NUM_ICS_WS2812_1CH_3X(bc.count); // only needs a third of "RGB" LEDs for NeoPixelBus
+  if (bc.type == TYPE_WS2811_2IC_5CH || bc.type == TYPE_WS2811_RGBCCT_DUAL) _lenDriver = bc.count * 2; // needs 2 "RGB" LEDs per pixel
+  _busPtr = PolyBus::create(_iType, _pins, _lenDriver + _skip, nr);
   _valid = (_busPtr != nullptr) && bc.count > 0;
   // fix for wled#4759
   if (_valid) for (unsigned i = 0; i < _skip; i++) {
@@ -254,19 +254,17 @@ void BusDigital::applyBriLimit(uint8_t newBri) {
   if (newBri < 255) {
     _NPBbri = newBri; // store value so it can be updated in show() (must be updated even if ABL is not used)
     uint8_t cctWW = 0, cctCW = 0;
-    unsigned hwLen = _len;
-    if (_type == TYPE_WS2812_1CH_X3) hwLen = NUM_ICS_WS2812_1CH_3X(_len); // only needs a third of "RGB" LEDs for NeoPixelBus
-    if (_type == TYPE_WS2811_2IC_5CH) hwLen = _len * 2; // needs 2 "RGB" LEDs per pixel
+    unsigned hwLen = _lenDriver;
     for (unsigned i = 0; i < hwLen; i++) {
       // For 5CH, map buffer index to logical pixel index to get correct color order
-      unsigned logicalPix = (_type == TYPE_WS2811_2IC_5CH) ? i / 2 : i + _start;
+      unsigned logicalPix = (_type == TYPE_WS2811_2IC_5CH || _type == TYPE_WS2811_RGBCCT_DUAL) ? i / 2 : i + _start;
       uint8_t co = _colorOrderMap.getPixelColorOrder(logicalPix + _start, _colorOrder);
       
       uint32_t c = PolyBus::getPixelColor(_busPtr, _iType, i, co);
       c = color_fade(c, newBri, true); // apply additional dimming
       
       // For 5CH, IC2 contains CW/WW in R/G channels, so we skip CCT recalculation
-      if (hasCCT() && _type != TYPE_WS2811_2IC_5CH) Bus::calculateCCT(c, cctWW, cctCW);
+      if (hasCCT() && _type != TYPE_WS2811_2IC_5CH && _type != TYPE_WS2811_RGBCCT_DUAL) Bus::calculateCCT(c, cctWW, cctCW);
       PolyBus::setPixelColor(_busPtr, _iType, i, c, co, (cctCW<<8) | cctWW); // repaint all pixels with new brightness
     }
   }
@@ -310,9 +308,11 @@ void IRAM_ATTR BusDigital::setPixelColor(unsigned pix, uint32_t c) {
     }
   }
 
+  if (pix >= _len) return;
+  uint16_t logicalPix = pix;
   if (_reversed) pix = _len - pix -1;
   pix += _skip;
-  const uint8_t co = _colorOrderMap.getPixelColorOrder(pix+_start, _colorOrder);
+  const uint8_t co = _colorOrderMap.getPixelColorOrder(logicalPix+_start, _colorOrder);
   if (_type == TYPE_WS2812_1CH_X3) { // map to correct IC, each controls 3 LEDs
     unsigned pOld = pix;
     pix = IC_INDEX_WS2812_1CH_3X(pix);
@@ -324,8 +324,8 @@ void IRAM_ATTR BusDigital::setPixelColor(unsigned pix, uint32_t c) {
     }
   }
   if (_type == TYPE_WS2811_2IC_5CH) { // map to correct ICs, each controls 1/2 LED
-    unsigned pOld = pix;
-    pix = pOld * 2;
+    unsigned pOld = logicalPix;
+    pix = _skip + pOld * 2;
     uint8_t cctWW = 0, cctCW = 0;
     if (hasCCT()) Bus::calculateCCT(c, cctWW, cctCW);
     // Check for CW/WW swap (upper nibble of color order)
@@ -341,6 +341,27 @@ void IRAM_ATTR BusDigital::setPixelColor(unsigned pix, uint32_t c) {
     PolyBus::setPixelColor(_busPtr, _iType, pix + 1, c2, COL_ORDER_RGB);
     return;
   }
+  if (_type == TYPE_WS2811_RGBCCT_DUAL) { // map logical RGBCCT pixel onto 2 WS2811 ICs
+    if (logicalPix >= _len) return;
+    uint16_t base = _skip + logicalPix * 2;
+    if (base + 1 >= _lenDriver + _skip) return;
+
+    uint8_t r  = R(c);
+    uint8_t g  = G(c);
+    uint8_t b  = B(c);
+    uint8_t ww = 0, cw = 0;
+    if (hasCCT()) Bus::calculateCCT(c, ww, cw);
+    // Check for CW/WW swap (upper nibble of color order)
+    if ((co >> 4) == 4) std::swap(ww, cw);
+
+    // IC1: R, G, B
+    PolyBus::setPixelColor(_busPtr, _iType, base, RGBW32(r, g, b, 0), co & 0x0F);
+
+    // IC2: CW, WW, unused
+    uint32_t c2 = RGBW32(cw, ww, 0, 0);
+    PolyBus::setPixelColor(_busPtr, _iType, base + 1, c2, COL_ORDER_RGB);
+    return;
+  }
   uint16_t wwcw = 0;
   if (hasCCT()) {
     uint8_t cctWW = 0, cctCW = 0;
@@ -354,9 +375,11 @@ void IRAM_ATTR BusDigital::setPixelColor(unsigned pix, uint32_t c) {
 // returns lossly restored color from bus
 uint32_t IRAM_ATTR BusDigital::getPixelColor(unsigned pix) const {
   if (!_valid) return 0;
+  if (pix >= _len) return 0;
+  uint16_t logicalPix = pix;
   if (_reversed) pix = _len - pix -1;
   pix += _skip;
-  const uint8_t co = _colorOrderMap.getPixelColorOrder(pix+_start, _colorOrder);
+  const uint8_t co = _colorOrderMap.getPixelColorOrder(logicalPix+_start, _colorOrder);
   uint32_t c = restoreColorLossy(PolyBus::getPixelColor(_busPtr, _iType, (_type==TYPE_WS2812_1CH_X3) ? IC_INDEX_WS2812_1CH_3X(pix) : pix, co),_NPBbri);
   if (_type == TYPE_WS2812_1CH_X3) { // map to correct IC, each controls 3 LEDs
     uint8_t r = R(c);
@@ -369,8 +392,8 @@ uint32_t IRAM_ATTR BusDigital::getPixelColor(unsigned pix) const {
     }
   }
   if (_type == TYPE_WS2811_2IC_5CH) { // map to correct ICs, each controls 1/2 LED
-    unsigned pOld = pix;
-    pix = pOld * 2;
+    unsigned pOld = logicalPix;
+    pix = _skip + pOld * 2;
     uint32_t c1 = PolyBus::getPixelColor(_busPtr, _iType, pix, co);
     uint32_t c2 = PolyBus::getPixelColor(_busPtr, _iType, pix + 1, co);
     // c1 has R, G, B; c2 has CW (R), WW (G)
@@ -379,8 +402,22 @@ uint32_t IRAM_ATTR BusDigital::getPixelColor(unsigned pix) const {
     uint8_t b = B(c1);
     uint8_t cw = R(c2);
     uint8_t ww = G(c2);
-    
+
     // Return RGB + max(CW, WW) as W
+    c = RGBW32(r, g, b, std::max(cw, ww));
+  }
+  if (_type == TYPE_WS2811_RGBCCT_DUAL) { // map to correct ICs, each controls part of logical RGBCCT pixel
+    unsigned pOld = logicalPix;
+    pix = _skip + pOld * 2;
+    uint32_t c1 = PolyBus::getPixelColor(_busPtr, _iType, pix, co);
+    uint32_t c2 = PolyBus::getPixelColor(_busPtr, _iType, pix + 1, co);
+
+    uint8_t r = R(c1);
+    uint8_t g = G(c1);
+    uint8_t b = B(c1);
+    uint8_t cw = R(c2);
+    uint8_t ww = G(c2);
+
     c = RGBW32(r, g, b, std::max(cw, ww));
   }
   if (_type == TYPE_WS2812_WWA) {
@@ -423,6 +460,7 @@ std::vector<LEDType> BusDigital::getLEDTypes() {
     {TYPE_SM16825,       "D",  PSTR("SM16825 RGBCW")},
     {TYPE_WS2812_1CH_X3, "D",  PSTR("WS2811 White")},
     //{TYPE_WS2812_2CH_X3, "D",  PSTR("WS281x CCT")}, // not implemented
+    {TYPE_WS2811_RGBCCT_DUAL, "D",  PSTR("WS2811 RGBCCT (dual IC)")},
     {TYPE_WS2811_2IC_5CH,"D",  PSTR("WS2811 2IC 5CH")},
     {TYPE_WS2812_WWA,    "D",  PSTR("WS281x WWA")}, // amber ignored
     {TYPE_WS2801,        "2P", PSTR("WS2801")},
@@ -1169,7 +1207,7 @@ size_t BusConfig::memUsage(unsigned nr) const {
   } else if (Bus::isDigital(type)) {
     // if any of digital buses uses I2S, there is additional common I2S DMA buffer not accounted for here
     unsigned len = count + skipAmount;
-    if (type == TYPE_WS2811_2IC_5CH) len *= 2;
+    if (type == TYPE_WS2811_2IC_5CH || type == TYPE_WS2811_RGBCCT_DUAL) len *= 2;
     return sizeof(BusDigital) + PolyBus::memUsage(len, PolyBus::getI(type, pins, nr));
   } else if (Bus::isOnOff(type)) {
     return sizeof(BusOnOff);

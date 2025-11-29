@@ -42,6 +42,33 @@ void getStringFromJson(char* dest, const char* src, size_t len) {
   if (src != nullptr) strlcpy(dest, src, len);
 }
 
+static uint8_t busTypeFromString(const String& typeStr) {
+  if (typeStr.equalsIgnoreCase(F("WS2811_RGBCCT_DUAL"))) return TYPE_WS2811_RGBCCT_DUAL;
+  if (typeStr.equalsIgnoreCase(F("WS2811_2IC_5CH")))    return TYPE_WS2811_2IC_5CH;
+  if (typeStr.equalsIgnoreCase(F("WS2805")))            return TYPE_WS2805;
+  if (typeStr.equalsIgnoreCase(F("WS2812_RGB")))        return TYPE_WS2812_RGB;
+  if (typeStr.equalsIgnoreCase(F("SK6812_RGBW")))       return TYPE_SK6812_RGBW;
+  if (typeStr.equalsIgnoreCase(F("WS2811_400KHZ")))     return TYPE_WS2811_400KHZ;
+  return 0;
+}
+
+static const char* busTypeToString(uint8_t type) {
+  switch (type) {
+    case TYPE_WS2811_RGBCCT_DUAL: return "WS2811_RGBCCT_DUAL";
+    case TYPE_WS2811_2IC_5CH:     return "WS2811_2IC_5CH";
+    case TYPE_WS2805:             return "WS2805";
+    case TYPE_WS2812_RGB:         return "WS2812_RGB";
+    case TYPE_SK6812_RGBW:        return "SK6812_RGBW";
+    case TYPE_WS2811_400KHZ:      return "WS2811_400KHZ";
+    default:                      return "";
+  }
+}
+
+static uint8_t busTypeFromJson(const JsonVariantConst& val) {
+  if (val.is<const char*>()) return busTypeFromString(String(val.as<const char*>()));
+  return val | 0;
+}
+
 bool deserializeConfig(JsonObject doc, bool fromFS) {
   bool needsSave = false;
   //int rev_major = doc["rev"][0]; // 1
@@ -221,7 +248,10 @@ bool deserializeConfig(JsonObject doc, bool fromFS) {
       uint8_t skipFirst = elm[F("skip")];
       uint16_t start = elm["start"] | 0;
       if (length==0 || start + length > MAX_LEDS) continue; // zero length or we reached max. number of LEDs, just stop
-      uint8_t ledType = elm["type"] | TYPE_WS2812_RGB;
+      JsonVariantConst typeVar = elm["type"];
+      uint8_t ledType = busTypeFromJson(typeVar);
+      if (!ledType) ledType = busTypeFromString(String((const char*)(elm[F("typestr")] | "")));
+      if (!ledType) ledType = TYPE_WS2812_RGB;
       bool reversed = elm["rev"];
       bool refresh = elm["ref"] | false;
       uint16_t freqkHz = elm[F("freq")] | 0;  // will be in kHz for DotStar and Hz for PWM
@@ -990,6 +1020,7 @@ void serializeConfig(JsonObject root) {
     ins["rev"]       = bus->isReversed();
     ins[F("skip")]   = bus->skippedLeds();
     ins["type"]      = bus->getType() & 0x7F;
+    ins[F("typestr")] = busTypeToString(bus->getType() & 0x7F);
     ins["ref"]       = bus->isOffRefreshRequired();
     ins[F("rgbwm")]  = bus->getAutoWhiteMode();
     ins[F("freq")]   = bus->getFrequency();

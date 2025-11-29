@@ -349,8 +349,10 @@ void IRAM_ATTR BusDigital::setPixelColor(unsigned pix, uint32_t c) {
     uint8_t r  = R(c);
     uint8_t g  = G(c);
     uint8_t b  = B(c);
-    uint8_t ww = W1(c); // warm
-    uint8_t cw = W2(c); // cool
+    uint8_t ww = 0, cw = 0;
+    if (hasCCT()) Bus::calculateCCT(c, ww, cw);
+    // Check for CW/WW swap (upper nibble of color order)
+    if ((co >> 4) == 4) std::swap(ww, cw);
 
     // IC1: R, G, B
     PolyBus::setPixelColor(_busPtr, _iType, base, RGBW32(r, g, b, 0), co & 0x0F);

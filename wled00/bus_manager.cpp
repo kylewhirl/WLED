@@ -304,12 +304,10 @@ void IRAM_ATTR BusDigital::setPixelColor(unsigned pix, uint32_t c) {
   if (BusManager::_useABL) {
     // if using ABL, sum all color channels to estimate current and limit brightness in show()
     uint8_t r = R(c), g = G(c), b = B(c);
+    uint8_t ww = W(c), cw = 0;
     if (_milliAmpsPerLed < 255) { // normal ABL
-      _colorSum += r + g + b + W(c);
-      if (_type == TYPE_WS2811_2IC_5CH && Bus::_cct >= 0 && Bus::_cct <= 255) {
-        // include cool-white contribution driven from the segment CCT slider
-        _colorSum += (Bus::_cct * _bri) / 255;
-      }
+      if (_type == TYPE_WS2811_2IC_5CH && hasCCT()) Bus::calculateCCT(c, ww, cw);
+      _colorSum += r + g + b + ww + cw;
     } else { // wacky WS2815 power model, ignore white channel, use max of RGB (issue #549)
       _colorSum += ((r > g) ? ((r > b) ? r : b) : ((g > b) ? g : b));
     }
@@ -331,21 +329,19 @@ void IRAM_ATTR BusDigital::setPixelColor(unsigned pix, uint32_t c) {
   if (_type == TYPE_WS2811_2IC_5CH) { // map to correct ICs, each controls 1/2 LED
     unsigned pOld = pix;
     pix = pOld * 2;
-    // Use W channel as warm white and global CCT slider as cool white to present RGBWC order logically
-    uint8_t warm = W(c); // already brightness scaled by color_fade()
-    uint8_t cool = 0;
-    if (Bus::_cct >= 0 && Bus::_cct <= 255) cool = Bus::_cct; // treat segment CCT slider as the cool-white channel
-    // Apply brightness to the cool-white channel as well
-    cool = (cool * _bri) / 255;
+    // Split the provided white channel into warm/cool using the segment CCT setting
+    uint8_t warm = 0, cool = 0;
+    Bus::calculateCCT(c, warm, cool);
 
     // Allow swapping of warm/cool assignment via the upper nibble of the color order map
     if ((co >> 4) == 4) std::swap(warm, cool);
 
     // IC1: R, G, B - no white component
-    PolyBus::setPixelColor(_busPtr, _iType, pix, RGBW32(R(c), G(c), B(c), 0), co & 0x0F);
+    uint8_t coRGB = co & 0x0F;
+    PolyBus::setPixelColor(_busPtr, _iType, pix, RGBW32(R(c), G(c), B(c), 0), coRGB);
 
-    // IC2: Cool, Warm, Unused - packed into R/G
-    PolyBus::setPixelColor(_busPtr, _iType, pix + 1, RGBW32(cool, warm, 0, 0), COL_ORDER_RGB);
+    // IC2: Cool, Warm, Unused - packed into the two driven channels with matching color order
+    PolyBus::setPixelColor(_busPtr, _iType, pix + 1, RGBW32(cool, warm, 0, 0), coRGB);
     return;
   }
   uint16_t wwcw = 0;
